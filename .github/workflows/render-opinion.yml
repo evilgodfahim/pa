@@ -2,7 +2,7 @@ name: Render Prothom Alo Opinion
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # Every 3 hours
+    - cron: "*/10 * * * *"   # Every 3 hours
   workflow_dispatch:         # Manual trigger
 
 jobs:

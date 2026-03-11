@@ -3,7 +3,9 @@
 Prothom Alo Opinion/Editorial scraper → RSS feed
 Parses the embedded Quintype JSON blob from prothomalo.com/opinion.
 
-Output: prothomalo_opinion.xml
+- Appends new articles to opinion.xml on each run (deduped by story id via guid)
+- Caps feed at MAX_ARTICLES=500; oldest articles are dropped when cap is exceeded
+- Output: opinion.xml
 """
 
 import json
@@ -11,16 +13,18 @@ import re
 import sys
 from datetime import datetime, timezone
 from email.utils import formatdate
-from xml.etree.ElementTree import Element, SubElement, tostring
+from pathlib import Path
+from xml.etree import ElementTree as ET
 from xml.dom.minidom import parseString
 
 import requests
 
-BASE_URL = "https://www.prothomalo.com"
+BASE_URL    = "https://www.prothomalo.com"
 OPINION_URL = f"{BASE_URL}/opinion"
-OUTPUT_FILE = "prothomalo_opinion.xml"
-IMAGE_CDN = "https://media.prothomalo.com"
+OUTPUT_FILE = Path("opinion.xml")
+IMAGE_CDN   = "https://media.prothomalo.com"
 IMAGE_WIDTH = 480
+MAX_ARTICLES = 500
 
 HEADERS = {
     "User-Agent": (
@@ -28,12 +32,15 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "bn-BD,bn;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
-    "Referer": BASE_URL,
+    "Referer":         BASE_URL,
 }
 
+# ---------------------------------------------------------------------------
+# Fetch + parse
+# ---------------------------------------------------------------------------
 
 def fetch_html(url: str) -> str:
     resp = requests.get(url, headers=HEADERS, timeout=30)
@@ -42,140 +49,188 @@ def fetch_html(url: str) -> str:
 
 
 def extract_quintype_json(html: str) -> dict:
-    """
-    Find the large Quintype data script tag and parse it.
-    It's an undecorated <script> block containing a JSON object starting with {"qt":...}
-    """
-    # Find script tag whose content starts with {"qt": (after optional whitespace)
-    pattern = re.compile(
+    """Find the large Quintype <script> block and parse it."""
+    match = re.search(
         r'<script[^>]*>\s*(\{"qt"\s*:.*?)\s*</script>',
+        html,
         re.DOTALL,
     )
-    match = pattern.search(html)
     if not match:
-        raise ValueError("Could not find Quintype JSON blob in page HTML")
+        raise ValueError("Quintype JSON blob not found in page HTML")
     return json.loads(match.group(1))
 
 
-def collect_stories(obj: object, stories: list) -> None:
-    """Recursively walk the collection tree and collect all story items."""
+def collect_stories(obj: object, out: list) -> None:
+    """Recursively walk collection tree, collect story dicts."""
     if isinstance(obj, dict):
         if obj.get("type") == "story" and "story" in obj:
-            stories.append(obj["story"])
+            out.append(obj["story"])
         for v in obj.values():
-            collect_stories(v, stories)
+            collect_stories(v, out)
     elif isinstance(obj, list):
         for item in obj:
-            collect_stories(item, stories)
+            collect_stories(item, out)
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def ms_to_rfc2822(ms: int) -> str:
-    """Convert epoch-milliseconds to RFC 2822 date string for RSS pubDate."""
     dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
     return formatdate(dt.timestamp(), usegmt=True)
 
 
-def ms_to_iso(ms: int) -> str:
-    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+def img_url(s3_key: str) -> str:
+    return f"{IMAGE_CDN}/{s3_key}?w={IMAGE_WIDTH}&auto=format" if s3_key else ""
 
 
-def image_url(s3_key: str) -> str:
-    if not s3_key:
-        return ""
-    return f"{IMAGE_CDN}/{s3_key}?w={IMAGE_WIDTH}&auto=format"
+def story_to_item(story: dict) -> ET.Element | None:
+    """Convert a raw story dict to an RSS <item> Element, or None if invalid."""
+    headline = story.get("headline", "").strip()
+    url = story.get("url", "") or f"{BASE_URL}/{story.get('slug', '')}"
+    if not headline or not url:
+        return None
+
+    pub_ms = story.get("published-at") or story.get("last-published-at")
+
+    authors = [
+        a.get("name", "").strip()
+        for a in story.get("authors", [])
+        if a.get("name", "").strip() not in ("লেখা: ", "")
+    ]
+
+    sections = story.get("sections", [])
+    section_name = (sections[0].get("display-name") or sections[0].get("name", "")) if sections else ""
+    subheadline = story.get("subheadline", "").strip()
+    description = subheadline or section_name
+
+    img = img_url(story.get("hero-image-s3-key", ""))
+
+    item = ET.Element("item")
+    ET.SubElement(item, "title").text = headline
+    ET.SubElement(item, "link").text  = url
+    ET.SubElement(item, "guid", isPermaLink="true").text = url
+
+    if description:
+        ET.SubElement(item, "description").text = description
+    if pub_ms:
+        ET.SubElement(item, "pubDate").text = ms_to_rfc2822(pub_ms)
+    if authors:
+        ET.SubElement(item, "dc:creator").text = ", ".join(authors)
+    if section_name:
+        ET.SubElement(item, "category").text = section_name
+    if img:
+        mc = ET.SubElement(item, "media:content")
+        mc.set("url", img)
+        mc.set("medium", "image")
+
+    return item
+
+# ---------------------------------------------------------------------------
+# RSS read / write with append + cap
+# ---------------------------------------------------------------------------
+
+NS = {
+    "media": "http://search.yahoo.com/mrss/",
+    "dc":    "http://purl.org/dc/elements/1.1/",
+}
+
+def load_existing_guids() -> set[str]:
+    """Return set of guid strings already in opinion.xml, or empty set."""
+    if not OUTPUT_FILE.exists():
+        return set()
+    try:
+        # Register namespaces so round-trip doesn't mangle them
+        for prefix, uri in NS.items():
+            ET.register_namespace(prefix, uri)
+        tree = ET.parse(OUTPUT_FILE)
+        return {g.text for g in tree.findall(".//guid") if g.text}
+    except ET.ParseError:
+        print("WARNING: existing opinion.xml is malformed; starting fresh.", file=sys.stderr)
+        return set()
 
 
-def build_rss(stories: list) -> str:
-    rss = Element("rss", version="2.0")
-    rss.set("xmlns:media", "http://search.yahoo.com/mrss/")
-    rss.set("xmlns:dc", "http://purl.org/dc/elements/1.1/")
-
-    channel = SubElement(rss, "channel")
-    SubElement(channel, "title").text = "প্রথম আলো মতামত"
-    SubElement(channel, "link").text = OPINION_URL
-    SubElement(channel, "description").text = (
-        "Prothom Alo opinion and editorial columns"
-    )
-    SubElement(channel, "language").text = "bn"
-    SubElement(channel, "lastBuildDate").text = formatdate(usegmt=True)
-
-    seen_ids: set[str] = set()
-
-    for story in stories:
-        story_id = story.get("id", "")
-        if story_id in seen_ids:
-            continue
-        seen_ids.add(story_id)
-
-        headline = story.get("headline", "").strip()
-        url = story.get("url", "")
-        if not url:
-            slug = story.get("slug", "")
-            url = f"{BASE_URL}/{slug}" if slug else ""
-        if not headline or not url:
-            continue
-
-        pub_ms = story.get("published-at") or story.get("last-published-at")
-        pub_date = ms_to_rfc2822(pub_ms) if pub_ms else ""
-
-        authors = story.get("authors", [])
-        author_name = ", ".join(
-            a.get("name", "").strip()
-            for a in authors
-            if a.get("name", "").strip() not in ("লেখা: ", "")
-        )
-
-        section_name = ""
-        sections = story.get("sections", [])
-        if sections:
-            section_name = sections[0].get("display-name") or sections[0].get("name", "")
-
-        subheadline = story.get("subheadline", "").strip()
-        description = subheadline if subheadline else section_name
-
-        img_key = story.get("hero-image-s3-key", "")
-        img = image_url(img_key)
-
-        item = SubElement(channel, "item")
-        SubElement(item, "title").text = headline
-        SubElement(item, "link").text = url
-        SubElement(item, "guid", isPermaLink="true").text = url
-
-        if description:
-            SubElement(item, "description").text = description
-        if pub_date:
-            SubElement(item, "pubDate").text = pub_date
-        if author_name:
-            SubElement(item, "dc:creator").text = author_name
-        if section_name:
-            SubElement(item, "category").text = section_name
-        if img:
-            media_content = SubElement(item, "media:content")
-            media_content.set("url", img)
-            media_content.set("medium", "image")
-
-    xml_bytes = tostring(rss, encoding="unicode")
-    return parseString(xml_bytes).toprettyxml(indent="  ")
+def load_existing_items() -> list[ET.Element]:
+    """Return list of existing <item> elements preserving order (newest first)."""
+    if not OUTPUT_FILE.exists():
+        return []
+    try:
+        tree = ET.parse(OUTPUT_FILE)
+        return list(tree.findall(".//item"))
+    except ET.ParseError:
+        return []
 
 
-def main():
+def build_rss(items: list[ET.Element]) -> str:
+    """Wrap item list in a channel + rss envelope and return pretty XML string."""
+    ET.register_namespace("",      "")           # default ns
+    ET.register_namespace("media", NS["media"])
+    ET.register_namespace("dc",    NS["dc"])
+
+    rss = ET.Element("rss", version="2.0")
+    rss.set("xmlns:media", NS["media"])
+    rss.set("xmlns:dc",    NS["dc"])
+
+    channel = ET.SubElement(rss, "channel")
+    ET.SubElement(channel, "title").text       = "প্রথম আলো মতামত"
+    ET.SubElement(channel, "link").text        = OPINION_URL
+    ET.SubElement(channel, "description").text = "Prothom Alo opinion and editorial columns"
+    ET.SubElement(channel, "language").text    = "bn"
+    ET.SubElement(channel, "lastBuildDate").text = formatdate(usegmt=True)
+
+    for item in items:
+        channel.append(item)
+
+    raw = ET.tostring(rss, encoding="unicode")
+    return parseString(raw).toprettyxml(indent="  ")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     print(f"Fetching {OPINION_URL} ...", file=sys.stderr)
     html = fetch_html(OPINION_URL)
 
     print("Parsing Quintype JSON ...", file=sys.stderr)
-    data = extract_quintype_json(html)
-
+    data       = extract_quintype_json(html)
     collection = data["qt"]["data"]["collection"]
-    stories: list = []
-    collect_stories(collection, stories)
-    print(f"Found {len(stories)} stories", file=sys.stderr)
 
-    rss_xml = build_rss(stories)
+    raw_stories: list[dict] = []
+    collect_stories(collection, raw_stories)
+    print(f"Scraped {len(raw_stories)} raw stories from page", file=sys.stderr)
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(rss_xml)
-    print(f"Written → {OUTPUT_FILE}", file=sys.stderr)
+    # Load what we already have
+    existing_guids = load_existing_guids()
+    existing_items = load_existing_items()
+
+    # Build new items (skip already-seen guids; dedupe within this batch too)
+    seen_in_batch: set[str] = set()
+    new_items: list[ET.Element] = []
+
+    for story in raw_stories:
+        url = story.get("url", "") or f"{BASE_URL}/{story.get('slug', '')}"
+        if url in existing_guids or url in seen_in_batch:
+            continue
+        seen_in_batch.add(url)
+        item = story_to_item(story)
+        if item is not None:
+            new_items.append(item)
+
+    print(f"New articles to append: {len(new_items)}", file=sys.stderr)
+
+    # Newest first: prepend new items to existing list
+    merged = new_items + existing_items
+
+    # Cap at MAX_ARTICLES — drop oldest (tail) when over limit
+    if len(merged) > MAX_ARTICLES:
+        dropped = len(merged) - MAX_ARTICLES
+        merged  = merged[:MAX_ARTICLES]
+        print(f"Cap reached: dropped {dropped} oldest articles", file=sys.stderr)
+
+    rss_xml = build_rss(merged)
+    OUTPUT_FILE.write_text(rss_xml, encoding="utf-8")
+    print(f"Written {len(merged)} articles → {OUTPUT_FILE}", file=sys.stderr)
 
 
 if __name__ == "__main__":

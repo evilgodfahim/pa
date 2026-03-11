@@ -3,7 +3,7 @@
 Prothom Alo Opinion/Editorial scraper → RSS feed
 Parses the embedded Quintype JSON blob from prothomalo.com/opinion.
 
-- Appends new articles to opinion.xml on each run (deduped by story id via guid)
+- Appends new articles to opinion.xml on each run (deduped by guid/url)
 - Caps feed at MAX_ARTICLES=500; oldest articles are dropped when cap is exceeded
 - Output: opinion.xml
 """
@@ -19,11 +19,11 @@ from xml.dom.minidom import parseString
 
 import requests
 
-BASE_URL    = "https://www.prothomalo.com"
-OPINION_URL = f"{BASE_URL}/opinion"
-OUTPUT_FILE = Path("opinion.xml")
-IMAGE_CDN   = "https://media.prothomalo.com"
-IMAGE_WIDTH = 480
+BASE_URL     = "https://www.prothomalo.com"
+OPINION_URL  = f"{BASE_URL}/opinion"
+OUTPUT_FILE  = Path("opinion.xml")
+IMAGE_CDN    = "https://media.prothomalo.com"
+IMAGE_WIDTH  = 480
 MAX_ARTICLES = 500
 
 HEADERS = {
@@ -38,6 +38,9 @@ HEADERS = {
     "Referer":         BASE_URL,
 }
 
+NS_MEDIA = "http://search.yahoo.com/mrss/"
+NS_DC    = "http://purl.org/dc/elements/1.1/"
+
 # ---------------------------------------------------------------------------
 # Fetch + parse
 # ---------------------------------------------------------------------------
@@ -49,15 +52,65 @@ def fetch_html(url: str) -> str:
 
 
 def extract_quintype_json(html: str) -> dict:
-    """Find the large Quintype <script> block and parse it."""
-    match = re.search(
-        r'<script[^>]*>\s*(\{"qt"\s*:.*?)\s*</script>',
+    """
+    Extract the Quintype page-data JSON using three strategies, most specific first.
+
+    Strategy 1: <script ... id="static-page" ...>{ ... }</script>
+                This is the canonical form seen in saved HTML.
+
+    Strategy 2: Any <script> whose stripped body starts with {"qt":
+                Handles minor whitespace/attribute variations.
+
+    Strategy 3: Any <script> body that contains the string '"qt":{"config"'
+                Handles cases where the blob is assigned to a JS variable,
+                e.g.  window.QT_DEFINED_DATA = {"qt":{"config": ...}}
+                We extract the {...} portion via json.JSONDecoder.raw_decode.
+    """
+
+    # --- Strategy 1: id="static-page" ---
+    m = re.search(
+        r'<script[^>]+id=["\']static-page["\'][^>]*>\s*(\{.*?)\s*</script>',
         html,
         re.DOTALL,
     )
-    if not match:
-        raise ValueError("Quintype JSON blob not found in page HTML")
-    return json.loads(match.group(1))
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError as e:
+            print(f"Strategy 1 JSON parse failed: {e}", file=sys.stderr)
+
+    # --- Strategy 2: script body starts with {"qt": ---
+    for body in re.findall(r'<script[^>]*>\s*(\{"qt"\s*:.*?)</script>', html, re.DOTALL):
+        try:
+            return json.loads(body.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # --- Strategy 3: script body contains "qt":{"config" anywhere ---
+    decoder = json.JSONDecoder()
+    for body in re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
+        if '"qt"' not in body or '"config"' not in body:
+            continue
+        # Find the first '{' that starts a valid JSON object containing "qt"
+        for i, ch in enumerate(body):
+            if ch != '{':
+                continue
+            try:
+                obj, _ = decoder.raw_decode(body, i)
+                if isinstance(obj, dict) and "qt" in obj:
+                    return obj
+            except json.JSONDecodeError:
+                continue
+
+    # --- All strategies failed: dump diagnostics ---
+    print("\n--- DIAGNOSTIC: first 2000 chars of fetched HTML ---", file=sys.stderr)
+    print(html[:2000], file=sys.stderr)
+    print("\n--- Script tag count:", html.count("<script"), file=sys.stderr)
+    print('--- "static-page" occurrences:', html.count("static-page"), file=sys.stderr)
+    print('--- "\"qt\"" occurrences:', html.count('"qt"'), file=sys.stderr)
+    raise ValueError(
+        "Quintype JSON blob not found. See diagnostic output above."
+    )
 
 
 def collect_stories(obj: object, out: list) -> None:
@@ -84,7 +137,7 @@ def img_url(s3_key: str) -> str:
     return f"{IMAGE_CDN}/{s3_key}?w={IMAGE_WIDTH}&auto=format" if s3_key else ""
 
 
-def story_to_item(story: dict) -> ET.Element | None:
+def story_to_item(story: dict):
     """Convert a raw story dict to an RSS <item> Element, or None if invalid."""
     headline = story.get("headline", "").strip()
     url = story.get("url", "") or f"{BASE_URL}/{story.get('slug', '')}"
@@ -100,7 +153,9 @@ def story_to_item(story: dict) -> ET.Element | None:
     ]
 
     sections = story.get("sections", [])
-    section_name = (sections[0].get("display-name") or sections[0].get("name", "")) if sections else ""
+    section_name = (
+        sections[0].get("display-name") or sections[0].get("name", "")
+    ) if sections else ""
     subheadline = story.get("subheadline", "").strip()
     description = subheadline or section_name
 
@@ -130,19 +185,11 @@ def story_to_item(story: dict) -> ET.Element | None:
 # RSS read / write with append + cap
 # ---------------------------------------------------------------------------
 
-NS = {
-    "media": "http://search.yahoo.com/mrss/",
-    "dc":    "http://purl.org/dc/elements/1.1/",
-}
-
-def load_existing_guids() -> set[str]:
+def load_existing_guids() -> set:
     """Return set of guid strings already in opinion.xml, or empty set."""
     if not OUTPUT_FILE.exists():
         return set()
     try:
-        # Register namespaces so round-trip doesn't mangle them
-        for prefix, uri in NS.items():
-            ET.register_namespace(prefix, uri)
         tree = ET.parse(OUTPUT_FILE)
         return {g.text for g in tree.findall(".//guid") if g.text}
     except ET.ParseError:
@@ -150,8 +197,8 @@ def load_existing_guids() -> set[str]:
         return set()
 
 
-def load_existing_items() -> list[ET.Element]:
-    """Return list of existing <item> elements preserving order (newest first)."""
+def load_existing_items() -> list:
+    """Return list of existing <item> elements (newest first)."""
     if not OUTPUT_FILE.exists():
         return []
     try:
@@ -161,21 +208,20 @@ def load_existing_items() -> list[ET.Element]:
         return []
 
 
-def build_rss(items: list[ET.Element]) -> str:
+def build_rss(items: list) -> str:
     """Wrap item list in a channel + rss envelope and return pretty XML string."""
-    ET.register_namespace("",      "")           # default ns
-    ET.register_namespace("media", NS["media"])
-    ET.register_namespace("dc",    NS["dc"])
+    ET.register_namespace("media", NS_MEDIA)
+    ET.register_namespace("dc",    NS_DC)
 
     rss = ET.Element("rss", version="2.0")
-    rss.set("xmlns:media", NS["media"])
-    rss.set("xmlns:dc",    NS["dc"])
+    rss.set("xmlns:media", NS_MEDIA)
+    rss.set("xmlns:dc",    NS_DC)
 
     channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text       = "প্রথম আলো মতামত"
-    ET.SubElement(channel, "link").text        = OPINION_URL
-    ET.SubElement(channel, "description").text = "Prothom Alo opinion and editorial columns"
-    ET.SubElement(channel, "language").text    = "bn"
+    ET.SubElement(channel, "title").text        = "প্রথম আলো মতামত"
+    ET.SubElement(channel, "link").text         = OPINION_URL
+    ET.SubElement(channel, "description").text  = "Prothom Alo opinion and editorial columns"
+    ET.SubElement(channel, "language").text     = "bn"
     ET.SubElement(channel, "lastBuildDate").text = formatdate(usegmt=True)
 
     for item in items:
@@ -191,12 +237,13 @@ def build_rss(items: list[ET.Element]) -> str:
 def main() -> None:
     print(f"Fetching {OPINION_URL} ...", file=sys.stderr)
     html = fetch_html(OPINION_URL)
+    print(f"Received {len(html)} bytes", file=sys.stderr)
 
     print("Parsing Quintype JSON ...", file=sys.stderr)
     data       = extract_quintype_json(html)
     collection = data["qt"]["data"]["collection"]
 
-    raw_stories: list[dict] = []
+    raw_stories = []
     collect_stories(collection, raw_stories)
     print(f"Scraped {len(raw_stories)} raw stories from page", file=sys.stderr)
 
@@ -204,9 +251,9 @@ def main() -> None:
     existing_guids = load_existing_guids()
     existing_items = load_existing_items()
 
-    # Build new items (skip already-seen guids; dedupe within this batch too)
-    seen_in_batch: set[str] = set()
-    new_items: list[ET.Element] = []
+    # Build new items — skip already-seen guids, dedupe within this batch
+    seen_in_batch = set()
+    new_items = []
 
     for story in raw_stories:
         url = story.get("url", "") or f"{BASE_URL}/{story.get('slug', '')}"
@@ -219,7 +266,7 @@ def main() -> None:
 
     print(f"New articles to append: {len(new_items)}", file=sys.stderr)
 
-    # Newest first: prepend new items to existing list
+    # Prepend new items (newest first), then existing
     merged = new_items + existing_items
 
     # Cap at MAX_ARTICLES — drop oldest (tail) when over limit
@@ -230,7 +277,7 @@ def main() -> None:
 
     rss_xml = build_rss(merged)
     OUTPUT_FILE.write_text(rss_xml, encoding="utf-8")
-    print(f"Written {len(merged)} articles → {OUTPUT_FILE}", file=sys.stderr)
+    print(f"Written {len(merged)} articles -> {OUTPUT_FILE}", file=sys.stderr)
 
 
 if __name__ == "__main__":

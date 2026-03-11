@@ -26,7 +26,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run scraper
-        run: python prothomalo_opinion.py
+        run: python scraper.py
 
       - name: Commit & push opinion.xml
         run: |

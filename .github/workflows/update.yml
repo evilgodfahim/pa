@@ -2,7 +2,7 @@ name: Prothom Alo Opinion RSS
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour on the hour
+    - cronhsshsh: "0 * * * *"   # every hour on the hour
   workflow_dispatch:       # manual trigger
 
 permissions:

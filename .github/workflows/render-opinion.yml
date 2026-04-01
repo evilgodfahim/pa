@@ -2,12 +2,13 @@ name: Render Prothom Alo Opinion
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # Every 3 hours
-  workflow_dispatch:         # Manual trigger
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
 
 jobs:
   render:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
 
@@ -27,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Generate opinion.xml
+      - name: Run scraper
         run: python scraper.py
 
       - name: Commit & push

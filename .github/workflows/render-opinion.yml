@@ -9,34 +9,26 @@ jobs:
   render:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # allow workflow to push
+      contents: write
 
     steps:
-      # 1️⃣ Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2️⃣ Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      # 3️⃣ Install dependencies
       - name: Install dependencies
         run: npm install
 
-      # 4️⃣ Render Opinion page
-      - name: Render Opinion page
-        run: npm run render
-
-      # 5️⃣ Commit & push generated HTML to root
       - name: Commit & push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add opinion.html
-          git diff --cached --quiet || git commit -m "Update rendered opinion page"
+          git diff --cached --quiet || git commit -m "Update opinion page"
           git push

@@ -26,7 +26,7 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 
-BASE_URL     = "https://en.prothomalo.com"
+BASE_URL     = "https://prothomalo.com"
 OPINION_URL  = f"{BASE_URL}/opinion"
 OUTPUT_FILE  = Path("opinion.xml")
 IMAGE_CDN    = "https://media.prothomalo.com"

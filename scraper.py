@@ -11,7 +11,7 @@ What it does:
 - Uses metadata.excerpt as description when available
 - Falls back to author avatar if no story image exists
 
-This version is hardened for GitHub Actions and bad encoding issues.
+This version fixes the duplicate-xmlns XML error.
 """
 
 from __future__ import annotations
@@ -372,9 +372,6 @@ def load_existing(file: Path) -> tuple[set[str], list[ET.Element]]:
 
 def build_rss(items: list[ET.Element]) -> str:
     rss = ET.Element("rss", version="2.0")
-    rss.set("xmlns:media", NS_MEDIA)
-    rss.set("xmlns:dc", NS_DC)
-    rss.set("xmlns:atom", NS_ATOM)
 
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = "Prothom Alo — Opinion"

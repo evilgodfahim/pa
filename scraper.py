@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Prothom Alo English Opinion scraper → RSS feed
+Prothom Alo Opinion scraper → RSS feeds
+
+Sources:
+  - https://prothomalo.com/opinion     → opinion.xml
+  - https://en.prothomalo.com/opinion  → opinion_en.xml
 
 What it does:
-- Fetches https://prothomalo.com/opinion
+- Fetches each opinion page
 - Extracts Quintype JSON from the page
-- Builds/updates opinion.xml
+- Builds/updates the corresponding XML
 - Dedupes by stable GUID
 - Keeps only the newest MAX_ARTICLES items
 - Uses metadata.excerpt as description when available
 - Falls back to author avatar if no story image exists
-
-This version fixes the duplicate-xmlns XML error.
 """
 
 from __future__ import annotations
@@ -33,10 +35,20 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://prothomalo.com"
-OPINION_URL = f"{BASE_URL}/opinion"
-OUTPUT_FILE = Path("opinion.xml")
-IMAGE_CDN = "https://media.prothomalo.com"
+SOURCES = [
+    {
+        "base_url":   "https://prothomalo.com",
+        "opinion_url": "https://prothomalo.com/opinion",
+        "output_file": Path("opinion.xml"),
+    },
+    {
+        "base_url":   "https://en.prothomalo.com",
+        "opinion_url": "https://en.prothomalo.com/opinion",
+        "output_file": Path("opinion_en.xml"),
+    },
+]
+
+IMAGE_CDN   = "https://media.prothomalo.com"
 IMAGE_WIDTH = 600
 MAX_ARTICLES = 500
 REQUEST_TIMEOUT = 30
@@ -51,17 +63,16 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
-    "Referer": BASE_URL,
     "Cache-Control": "no-cache",
 }
 
 NS_MEDIA = "http://search.yahoo.com/mrss/"
-NS_DC = "http://purl.org/dc/elements/1.1/"
-NS_ATOM = "http://www.w3.org/2005/Atom"
+NS_DC    = "http://purl.org/dc/elements/1.1/"
+NS_ATOM  = "http://www.w3.org/2005/Atom"
 
 ET.register_namespace("media", NS_MEDIA)
-ET.register_namespace("dc", NS_DC)
-ET.register_namespace("atom", NS_ATOM)
+ET.register_namespace("dc",    NS_DC)
+ET.register_namespace("atom",  NS_ATOM)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +110,7 @@ def build_image_url(s3_key: str, width: int = IMAGE_WIDTH) -> str:
 def fetch_html(url: str, retries: int = RETRIES) -> str:
     last_err: Exception | None = None
     session = requests.Session()
-    session.headers.update(HEADERS)
+    session.headers.update({**HEADERS, "Referer": "/".join(url.split("/")[:3])})
 
     for attempt in range(1, retries + 1):
         try:
@@ -111,13 +122,13 @@ def fetch_html(url: str, retries: int = RETRIES) -> str:
 
             html = resp.text
             if len(html) < 500:
-                raise ValueError(f"Response too small to be real HTML ({len(html)} chars)")
+                raise ValueError(f"Response too small ({len(html)} chars)")
 
-            print(f"Fetched {len(html):,} chars (attempt {attempt})", file=sys.stderr)
+            print(f"  Fetched {len(html):,} chars (attempt {attempt})", file=sys.stderr)
             return html
         except Exception as e:
             last_err = e
-            print(f"Attempt {attempt} failed: {e}", file=sys.stderr)
+            print(f"  Attempt {attempt} failed: {e}", file=sys.stderr)
             if attempt < retries:
                 time.sleep(2 * attempt)
 
@@ -145,8 +156,7 @@ def _try_json(text: str) -> dict | None:
 def extract_quintype_json(html: str) -> dict:
     m = re.search(
         r'<script[^>]+id=["\']static-page["\'][^>]*>(\{.*?\})</script>',
-        html,
-        re.DOTALL,
+        html, re.DOTALL,
     )
     if m:
         obj = _try_json(m.group(1))
@@ -175,10 +185,8 @@ def extract_quintype_json(html: str) -> dict:
     print("\n--- DIAGNOSTIC ---", file=sys.stderr)
     print(f"HTML length: {len(html)}", file=sys.stderr)
     print(f"<script> tags: {html.count('<script')}", file=sys.stderr)
-    print(f'"static-page": {html.count("static-page")}', file=sys.stderr)
-    qt_count = html.count('"qt"')
-    print(f'"qt": {qt_count}', file=sys.stderr)
-    print("First 1200 chars of decoded HTML:", file=sys.stderr)
+    print(f'"qt": {html.count(chr(34) + "qt" + chr(34))}', file=sys.stderr)
+    print("First 1200 chars:", file=sys.stderr)
     print(html[:1200], file=sys.stderr)
     raise ValueError("Quintype JSON blob not found. See diagnostic output above.")
 
@@ -199,7 +207,7 @@ def collect_stories(obj: object, out: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Story field helpers
+# Story field helpers  (base_url passed explicitly — no global dependency)
 # ---------------------------------------------------------------------------
 
 def get_description(story: dict) -> str:
@@ -225,8 +233,7 @@ def get_thumbnail(story: dict) -> str:
     if hero:
         return build_image_url(hero)
 
-    authors = story.get("authors") or []
-    for author in authors:
+    for author in story.get("authors") or []:
         if not isinstance(author, dict):
             continue
         avatar_url = safe_text(author.get("avatar-url"))
@@ -251,17 +258,14 @@ def get_authors(story: dict) -> list[str]:
 
 
 def get_tags(story: dict) -> list[str]:
-    result: list[str] = []
-    for tag in story.get("tags") or []:
-        if not isinstance(tag, dict):
-            continue
-        name = safe_text(tag.get("name"))
-        if name:
-            result.append(name)
-    return result
+    return [
+        safe_text(tag.get("name"))
+        for tag in (story.get("tags") or [])
+        if isinstance(tag, dict) and safe_text(tag.get("name"))
+    ]
 
 
-def get_story_url(story: dict) -> str:
+def get_story_url(story: dict, base_url: str) -> str:
     url = safe_text(story.get("url"))
     if url:
         return url
@@ -269,15 +273,15 @@ def get_story_url(story: dict) -> str:
     if slug:
         if slug.startswith("http://") or slug.startswith("https://"):
             return slug
-        return f"{BASE_URL}/{slug.lstrip('/')}"
+        return f"{base_url}/{slug.lstrip('/')}"
     return ""
 
 
-def get_story_guid(story: dict) -> str:
+def get_story_guid(story: dict, base_url: str) -> str:
     story_id = safe_text(story.get("id"))
     if story_id:
-        return f"{BASE_URL}/story/{story_id}"
-    return get_story_url(story)
+        return f"{base_url}/story/{story_id}"
+    return get_story_url(story, base_url)
 
 
 def get_pub_ms(story: dict) -> int | None:
@@ -296,18 +300,17 @@ def get_pub_ms(story: dict) -> int | None:
 # Story → RSS item
 # ---------------------------------------------------------------------------
 
-def story_to_item(story: dict) -> ET.Element | None:
+def story_to_item(story: dict, base_url: str) -> ET.Element | None:
     headline = safe_text(story.get("headline"))
-    url = get_story_url(story)
-    guid = get_story_guid(story)
+    url      = get_story_url(story, base_url)
+    guid     = get_story_guid(story, base_url)
 
     if not headline or not url or not guid:
         return None
 
     item = ET.Element("item")
-
     ET.SubElement(item, "title").text = headline
-    ET.SubElement(item, "link").text = url
+    ET.SubElement(item, "link").text  = url
     ET.SubElement(item, "guid", isPermaLink="false").text = guid
 
     description = get_description(story)
@@ -326,7 +329,7 @@ def story_to_item(story: dict) -> ET.Element | None:
     if sections and isinstance(sections, list):
         first = sections[0] or {}
         section_name = safe_text(first.get("display-name") or first.get("name"))
-        section_url = safe_text(first.get("section-url"))
+        section_url  = safe_text(first.get("section-url"))
         if section_name:
             cat = ET.SubElement(item, "category")
             cat.text = section_name
@@ -341,8 +344,7 @@ def story_to_item(story: dict) -> ET.Element | None:
         mc = ET.SubElement(item, f"{{{NS_MEDIA}}}content")
         mc.set("url", thumbnail)
         mc.set("medium", "image")
-        mt = ET.SubElement(mc, f"{{{NS_MEDIA}}}title")
-        mt.text = headline
+        ET.SubElement(mc, f"{{{NS_MEDIA}}}title").text = headline
 
     return item
 
@@ -354,10 +356,9 @@ def story_to_item(story: dict) -> ET.Element | None:
 def load_existing(file: Path) -> tuple[set[str], list[ET.Element]]:
     if not file.exists():
         return set(), []
-
     try:
-        tree = ET.parse(file)
-        root = tree.getroot()
+        tree  = ET.parse(file)
+        root  = tree.getroot()
         items = list(root.findall("./channel/item"))
         guids = {
             safe_text(item.findtext("guid"))
@@ -366,23 +367,23 @@ def load_existing(file: Path) -> tuple[set[str], list[ET.Element]]:
         }
         return guids, items
     except ET.ParseError as e:
-        print(f"WARNING: {file} is malformed ({e}); starting fresh.", file=sys.stderr)
+        print(f"  WARNING: {file} is malformed ({e}); starting fresh.", file=sys.stderr)
         return set(), []
 
 
-def build_rss(items: list[ET.Element]) -> str:
-    rss = ET.Element("rss", version="2.0")
-
+def build_rss(items: list[ET.Element], opinion_url: str, label: str) -> str:
+    rss     = ET.Element("rss", version="2.0")
     channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text = "Prothom Alo — Opinion"
-    ET.SubElement(channel, "link").text = OPINION_URL
-    ET.SubElement(channel, "description").text = "Opinion articles from Prothom Alo English"
-    ET.SubElement(channel, "language").text = "en"
+
+    ET.SubElement(channel, "title").text       = f"Prothom Alo — {label}"
+    ET.SubElement(channel, "link").text        = opinion_url
+    ET.SubElement(channel, "description").text = f"Opinion articles from {label}"
+    ET.SubElement(channel, "language").text    = "en"
     ET.SubElement(channel, "lastBuildDate").text = formatdate(usegmt=True)
 
     atom_link = ET.SubElement(channel, f"{{{NS_ATOM}}}link")
-    atom_link.set("href", OPINION_URL)
-    atom_link.set("rel", "self")
+    atom_link.set("href", opinion_url)
+    atom_link.set("rel",  "self")
     atom_link.set("type", "application/rss+xml")
 
     for item in items:
@@ -393,58 +394,67 @@ def build_rss(items: list[ET.Element]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Per-source runner
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    print(f"Fetching {OPINION_URL} ...", file=sys.stderr)
-    html = fetch_html(OPINION_URL)
+def run_source(base_url: str, opinion_url: str, output_file: Path) -> None:
+    label = opinion_url.replace("https://", "").replace("/opinion", "")
+    print(f"\n=== {opinion_url} → {output_file} ===", file=sys.stderr)
 
-    print("Extracting Quintype JSON ...", file=sys.stderr)
+    html = fetch_html(opinion_url)
+
+    print("  Extracting Quintype JSON ...", file=sys.stderr)
     data = extract_quintype_json(html)
 
     try:
         collection = data["qt"]["data"]["collection"]
     except Exception as e:
-        raise KeyError(f"Could not find qt.data.collection in extracted JSON: {e}")
+        raise KeyError(f"Could not find qt.data.collection: {e}")
 
     raw_stories: list[dict] = []
     collect_stories(collection, raw_stories)
-    print(f"Stories scraped from page: {len(raw_stories)}", file=sys.stderr)
+    print(f"  Stories scraped: {len(raw_stories)}", file=sys.stderr)
 
-    existing_guids, existing_items = load_existing(OUTPUT_FILE)
-    print(f"Existing articles in feed: {len(existing_items)}", file=sys.stderr)
+    existing_guids, existing_items = load_existing(output_file)
+    print(f"  Existing in feed: {len(existing_items)}", file=sys.stderr)
 
     seen_in_batch: set[str] = set()
     new_items: list[ET.Element] = []
 
     for story in raw_stories:
-        item = story_to_item(story)
+        item = story_to_item(story, base_url)
         if item is None:
             continue
-
         guid = safe_text(item.findtext("guid"))
-        if not guid:
+        if not guid or guid in existing_guids or guid in seen_in_batch:
             continue
-
-        if guid in existing_guids or guid in seen_in_batch:
-            continue
-
         seen_in_batch.add(guid)
         new_items.append(item)
 
-    print(f"New articles to append: {len(new_items)}", file=sys.stderr)
+    print(f"  New articles: {len(new_items)}", file=sys.stderr)
 
     merged = new_items + existing_items
-
     if len(merged) > MAX_ARTICLES:
         dropped = len(merged) - MAX_ARTICLES
-        merged = merged[:MAX_ARTICLES]
-        print(f"Cap reached: dropped {dropped} oldest articles", file=sys.stderr)
+        merged  = merged[:MAX_ARTICLES]
+        print(f"  Cap reached: dropped {dropped} oldest", file=sys.stderr)
 
-    rss_xml = build_rss(merged)
-    OUTPUT_FILE.write_text(rss_xml, encoding="utf-8")
-    print(f"Done — {len(merged)} articles written to {OUTPUT_FILE}", file=sys.stderr)
+    rss_xml = build_rss(merged, opinion_url, label)
+    output_file.write_text(rss_xml, encoding="utf-8")
+    print(f"  Done — {len(merged)} articles → {output_file}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    for src in SOURCES:
+        run_source(
+            base_url    = src["base_url"],
+            opinion_url = src["opinion_url"],
+            output_file = src["output_file"],
+        )
 
 
 if __name__ == "__main__":
